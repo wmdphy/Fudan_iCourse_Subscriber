@@ -60,20 +60,11 @@ def process_lecture(
         print(f"    [Time] Streaming audio at {time.strftime('%H:%M:%S')}")
         print(f"    [URL] {vpn_url[:100]}...")
 
-        # Probe video duration for completeness check
-        expected_dur = Transcriber.probe_duration(vpn_url, http_headers)
-        if expected_dur:
-            print(f"    [Probe] Video duration: {expected_dur:.0f}s"
-                  f" ({expected_dur / 60:.1f}min)")
-        else:
-            print(f"    [Probe] Could not determine video duration")
-
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 transcript = transcriber.transcribe_url(
                     vpn_url, http_headers=http_headers,
-                    expected_duration=expected_dur,
                 )
                 db.update_transcript(sub_id, transcript)
                 break

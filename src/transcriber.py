@@ -1,6 +1,7 @@
 """Speech-to-text using ffmpeg pipe + sherpa-onnx SenseVoice + silero VAD."""
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -20,6 +21,7 @@ class Transcriber:
         self._vad_config = None
         self._last_duration = 0.0  # audio seconds from last transcription
         self._last_transcript = ""  # transcript from last transcription
+        self._media_duration = None  # total media duration parsed from ffmpeg stderr
 
     def _init(self):
         if self._recognizer is not None:
@@ -189,9 +191,26 @@ class Transcriber:
             stderr_thread.join(timeout=5)
             stderr_output = b"".join(stderr_chunks)
 
+        # Parse total media duration from ffmpeg stderr (e.g. "Duration: 01:23:45.67")
+        self._media_duration = None
+        dur_match = re.search(
+            rb"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr_output,
+        )
+        if dur_match:
+            h, m, s = dur_match.groups()
+            self._media_duration = int(h) * 3600 + int(m) * 60 + float(s)
+
         elapsed = time.time() - t0
         duration = total_read / sample_rate
         self._last_duration = duration
+
+        if self._media_duration:
+            print(
+                f"[Transcriber] Media duration: {self._media_duration:.0f}s"
+                f" ({self._media_duration / 60:.1f}min),"
+                f" received: {duration:.0f}s ({duration / 60:.1f}min)",
+                flush=True,
+            )
 
         if proc.returncode not in (0, -9, None):
             stderr_text = stderr_output.decode(errors="replace")[-500:]
@@ -269,8 +288,7 @@ class Transcriber:
         return None
 
     def transcribe_url(self, url: str, timeout: int = 7200,
-                       http_headers: str | None = None,
-                       expected_duration: float | None = None) -> str:
+                       http_headers: str | None = None) -> str:
         """Stream audio directly from a URL (no video download needed).
 
         Args:
@@ -278,12 +296,10 @@ class Transcriber:
             timeout: Max seconds before killing the process.
             http_headers: ffmpeg-compatible HTTP headers string,
                           e.g. "Cookie: x=y\\r\\nUser-Agent: z\\r\\n"
-            expected_duration: If provided, raise IncompleteAudioError when
-                               received audio is < 90% of this value.
 
         Raises:
-            IncompleteAudioError: If audio duration is significantly less than
-                                  expected (likely a connection drop).
+            IncompleteAudioError: If received audio is < 90% of the media's
+                                  total duration (likely a connection drop).
         """
         cmd = ["ffmpeg"]
         if http_headers:
@@ -299,16 +315,16 @@ class Transcriber:
         ]
         transcript = self._transcribe_from_cmd(cmd, timeout=timeout)
 
-        # Check if we received enough audio
-        if expected_duration and expected_duration > 0:
+        # Check completeness using duration parsed from ffmpeg stderr
+        if self._media_duration and self._media_duration > 0:
             actual = self._last_duration
-            ratio = actual / expected_duration
+            ratio = actual / self._media_duration
             if ratio < 0.9:
                 raise IncompleteAudioError(
-                    f"Only received {actual:.0f}s of {expected_duration:.0f}s"
+                    f"Only received {actual:.0f}s of {self._media_duration:.0f}s"
                     f" audio ({ratio:.0%}). Connection may have dropped.",
                     actual_duration=actual,
-                    expected_duration=expected_duration,
+                    expected_duration=self._media_duration,
                 )
 
         return transcript
