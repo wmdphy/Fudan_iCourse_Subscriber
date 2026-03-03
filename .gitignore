@@ -19,3 +19,9 @@ vosk-model-*/
 
 任务描述.md
 get_course_text/
+
+docs/*
+!docs/*.png
+
+*.mp3
+bugs.md

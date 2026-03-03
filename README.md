@@ -10,10 +10,10 @@
 
 1. 登录你的复旦 iCourse 账号（通过 WebVPN）
 2. 检查这两门课是否有新的录播视频
-3. 如果有：下载视频 → 语音识别 → AI 生成课程笔记
+3. 如果有：流式提取音频 → 语音识别 → AI 生成课程笔记
 4. 将所有新课次的笔记汇总成**一封邮件**发送给你
 
-邮件包含专业排版的 Markdown 渲染内容，覆盖课程重点、讲解内容、例子讲解等。如果老师提到了作业、考试、签到、组队等重要课程事项，会在笔记开头醒目标注。
+邮件包含专业排版的 Markdown 渲染内容（含 LaTeX 公式渲染），覆盖课程重点、讲解内容、例子讲解等。如果老师提到了作业、考试、签到、组队等重要课程事项，会在笔记开头醒目标注。
 
 > [!CAUTION]
 > **⚠️ 合规使用声明**
@@ -77,7 +77,7 @@
 
 ### 第 6 步：运行
 
-- **自动运行**：默认为每天下午13:00、晚上20:00（北京时间）自动执行，如需修改可在 `check.yml` 中修改 cron
+- **自动运行**：默认为每天下午 13:00、晚上 22:00（北京时间）自动执行，如需修改可在 `check.yml` 中修改 cron
 - **手动触发**：进入仓库 → Actions → iCourse Check → Run workflow
 
 首次运行会处理所有已有录播，后续只处理新增课次。
@@ -113,8 +113,8 @@ python main.py
 
 ## 数据安全与知识产权
 
-- **不保留视频**：视频下载后立即通过 ffmpeg 管道转录，转录完成立即删除
-- **数据库加密存储**：SQLite 数据库在提交到仓库前使用 AES-256-CBC 加密，密钥由你的多个 Secret 拼接派生，即使仓库公开，他人也无法解密
+- **不保留视频**：音频通过 ffmpeg 管道从 CDN 流式提取并实时转录，全程不下载或保存任何视频/音频文件
+- **数据库加密存储**：SQLite 数据库使用 AES-256-CBC 加密后推送到独立的 `data` 分支，密钥由你的多个 Secret 拼接派生，即使仓库公开，他人也无法解密
 - **隐私日志**：所有控制台输出已审计，不会打印 token、密码、URL 等敏感信息到 Actions 日志
 - **Fork 安全**：他人 Fork 你的仓库后，因 Secret 不同会解密失败，程序会自动从空数据库开始，不会报错
 
@@ -132,12 +132,15 @@ python main.py
 │   ├── config.py           # 环境变量与常量配置
 │   ├── webvpn.py           # WebVPN AES 加密 + 7 步 IDP 认证
 │   ├── icourse.py          # iCourse API 客户端 + CDN 视频签名
-│   ├── transcriber.py      # ffmpeg 管道 + silero VAD + SenseVoice ASR
-│   ├── summarizer.py       # ModelScope LLM 摘要生成
-│   ├── emailer.py          # 批量邮件：Markdown → HTML 渲染 + CSS 排版
-│   └── database.py         # SQLite 课次追踪与状态管理
+│   ├── transcriber.py      # ffmpeg 流式管道 + silero VAD + SenseVoice ASR
+│   ├── summarizer.py       # ModelScope LLM 多模型回退摘要生成
+│   ├── emailer.py          # 批量邮件：Markdown + LaTeX → HTML 渲染 + CSS 排版
+│   └── database.py         # SQLite 课次追踪、状态管理与运行时迁移
+├── scripts/
+│   └── reset_course_data.py # 数据库重置工具（按课程/课次删除数据）
 ├── .github/workflows/
-│   └── check.yml           # GitHub Actions 定时任务 + 加密数据库持久化
+│   ├── check.yml           # 定时任务 + 加密数据库持久化 (data 分支)
+│   └── reset_data.yml      # 手动触发：重置指定课程数据
 ├── requirements.txt
 └── .env.example
 ```
@@ -147,48 +150,46 @@ python main.py
 ```mermaid
 flowchart TD
     %% GitHub Actions 层级
-    subgraph Cron ["GitHub Actions Cron (每天 22:00 UTC+8)"]
-        A1["1. 解密 data/icourse.db.enc → data/icourse.db"]
+    subgraph Cron ["GitHub Actions Cron (每天 13:00 & 22:00 UTC+8)"]
+        A1["1. 从 data 分支拉取并解密 icourse.db"]
         A2["2. python main.py"]
-        A3["3. 加密 data/icourse.db → git commit + push"]
+        A3["3. 加密 icourse.db → 推送到 data 分支"]
     end
 
     %% Python 脚本层级
     subgraph Main ["main.py: run()"]
         B1["WebVPN 登录 + iCourse CAS 认证<br/>(5 次重试)"]
-        
+
         %% 课程循环
         subgraph CourseLoop ["for each course_id in COURSE_IDS"]
-            C1["检查 session → 获取课程详情<br/>对比 DB → 筛选未处理的课次<br/>(playback_status=1 且未处理)"]
-            
+            C1["检查 session → 获取课程详情<br/>对比 DB → 筛选未处理的课次<br/>按 sub_title 去重"]
+
             %% 课次循环
             subgraph LectureLoop ["for each new lecture"]
                 D1["检查 session (防过期)"]
                 D2["get_video_url → 签名 CDN URL"]
-                D3["download_video (流式下载)"]
-                D4["transcribe_video (管道转录)"]
-                D5["删除视频文件"]
-                D6["summarize (LLM 摘要)"]
-                D7["存入 DB, 标记 processed<br/>收集到 email_items"]
-                
-                D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7
+                D3["ffprobe 探测视频总时长"]
+                D4["ffmpeg 流式提取音频 + VAD + ASR 转录<br/>(不完整时自动重试，最多 3 次)"]
+                D5["summarize (多模型 LLM 摘要)"]
+                D6["存入 DB, 标记 processed<br/>收集到 email_items"]
+
+                D1 --> D2 --> D3 --> D4 --> D5 --> D6
             end
-            
+
             C1 --> D1
         end
-        
-        E1["批量发送邮件 (1 封包含所有摘要)<br/>标记 emailed"]
-        
+
+        E1["回收未发送课次 + 批量发送邮件<br/>(含 LaTeX 渲染, 3 次重试)<br/>标记 emailed"]
+
         B1 --> C1
-        D7 --> E1
+        D6 --> E1
     end
 
     %% 定义跨模块的执行流转连线
     A1 --> A2
     A2 -->|触发脚本执行| B1
     E1 -->|执行完毕返回| A3
-    
-    %% 可选：给循环框加一点虚线样式以区分普通模块
+
     classDef loopBlock fill:#f0f8ff,stroke:#00509E,stroke-width:1.5px,stroke-dasharray: 5 5;
     class CourseLoop,LectureLoop loopBlock;
 ```
@@ -240,20 +241,23 @@ signed_url = f"{video_url}?clientUUID={uuid4()}&t={t}"
 
 ### 语音转文字管道（`src/transcriber.py`）
 
-采用流式管道架构，避免将整个视频加载到内存：
+采用流式管道架构，直接从 CDN 提取音频并实时转录，全程不保存任何文件：
 
 ```
-Video File
+CDN Video URL (通过 WebVPN 鉴权)
     │
     ▼
- ffmpeg (子进程)
-    │  -ar 16000 -ac 1 -f f32le  (16kHz 单声道 PCM float32)
+ ffmpeg (子进程, 带 Cookie/UA headers)
+    │  -vn -ar 16000 -ac 1 -f f32le  (丢弃视频, 16kHz 单声道 PCM float32)
+    │  -reconnect 1 (断线自动重连)
     │
     ▼ stdout pipe (每次读 1 秒 = 64KB)
     │
  silero VAD
     │  512 样本窗口 (32ms), 最小静音 0.25s
+    │  每次转录前重建实例 (防止 INT32 计数器溢出)
     │  检测语音边界，输出语音片段
+    │  30 分钟无语音 → 插入 [音频中断] 标记
     │
     ▼
  SenseVoice (sherpa-onnx)
@@ -264,16 +268,23 @@ Video File
  拼接文本 → 写入数据库
 ```
 
-模型懒加载：首次转录时才初始化 SenseVoice + VAD，后续复用实例。视频转录完成后立即删除视频文件，节省 GitHub Actions 磁盘空间。
+关键机制：
+- **模型懒加载**：首次转录时才初始化 SenseVoice + VAD，后续复用实例
+- **VAD 重置**：每次转录前重建 VAD 实例，防止内部 INT32 样本计数器在长音频后溢出导致 onnxruntime 崩溃
+- **静音检测**：连续 30 分钟无语音时在转录文本中插入中断标记，提醒 LLM 摘要时说明音频可能不完整
+- **时长校验**：转录前用 ffprobe 探测视频总时长，转录完成后比对实际接收时长，低于 90% 则判定为连接中断并自动重试（最多 3 次）
+- **进度报告**：每 60 秒输出已接收的音频时长、数据量、下载速率和识别段数
 
 ### 数据库持久化（GitHub Actions）
 
-GitHub Actions 每次运行在全新容器中，无法保留文件。本项目通过以下方式持久化 SQLite 数据库：
+GitHub Actions 每次运行在全新容器中，无法保留文件。本项目通过独立的 `data` 分支持久化 SQLite 数据库：
 
-1. **运行前**：从仓库解密 `data/icourse.db.enc` → `data/icourse.db`
-2. **运行后**：比较 MD5，如果数据库有变化则加密并 `git commit + push`
-3. **加密密钥**：由 `STUID + UISPSW + DASHSCOPE_API_KEY + SMTP_PASSWORD` 拼接，确保只有 Secret 持有者能解密
+1. **运行前**：从 `data` 分支拉取 `data/icourse.db.enc`，解密为 `data/icourse.db`
+2. **运行后**：比较 MD5，如果数据库有变化则加密并强制推送到 `data` 分支（与代码分支隔离，避免 commit 冲突，同时也为了避免git在多次commit中多次记录无法比对差异的二进制加密数据库文件导致存储空间爆炸）
+3. **加密密钥**：由你的多个secrets拼接，确保数据库无法解密。
 4. **Fork 兼容**：解密失败时自动从空数据库开始，输出 GitHub warning 提示
+5. **数据库迁移**：运行时自动检测表结构并添加新列（`error_msg`, `error_count`, `error_stage`, `summary_model`），无需手动迁移
+6. **数据重置**：通过 Actions → Reset Course Data 手动触发，支持按课程/课次删除数据以触发重新处理
 
 ### 依赖
 

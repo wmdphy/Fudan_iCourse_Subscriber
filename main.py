@@ -12,7 +12,7 @@ from src.database import Database
 from src.emailer import Emailer
 from src.icourse import ICourseClient
 from src.summarizer import Summarizer
-from src.transcriber import Transcriber
+from src.transcriber import IncompleteAudioError, Transcriber
 from src.webvpn import WebVPNSession
 
 
@@ -56,16 +56,44 @@ def process_lecture(
             print(f"    No video URL for {sub_id}, skipping.")
             return None
 
-        try:
-            vpn_url, http_headers = client.get_stream_params(video_url)
-            print(f"    [Time] Streaming audio at {time.strftime('%H:%M:%S')}")
-            print(f"    [URL] {vpn_url[:100]}...")
-            transcript = transcriber.transcribe_url(vpn_url, http_headers=http_headers)
-            db.update_transcript(sub_id, transcript)
-        except Exception as e:
-            print(f"    [FAIL] Transcription error: {type(e).__name__}: {e}")
-            db.update_error(sub_id, "transcribe", str(e))
-            raise
+        vpn_url, http_headers = client.get_stream_params(video_url)
+        print(f"    [Time] Streaming audio at {time.strftime('%H:%M:%S')}")
+        print(f"    [URL] {vpn_url[:100]}...")
+
+        # Probe video duration for completeness check
+        expected_dur = Transcriber.probe_duration(vpn_url, http_headers)
+        if expected_dur:
+            print(f"    [Probe] Video duration: {expected_dur:.0f}s"
+                  f" ({expected_dur / 60:.1f}min)")
+        else:
+            print(f"    [Probe] Could not determine video duration")
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                transcript = transcriber.transcribe_url(
+                    vpn_url, http_headers=http_headers,
+                    expected_duration=expected_dur,
+                )
+                db.update_transcript(sub_id, transcript)
+                break
+            except IncompleteAudioError as e:
+                print(f"    [WARN] Attempt {attempt}/{max_attempts}: {e}")
+                if attempt < max_attempts:
+                    # Re-login and get fresh URL for retry
+                    client = _check_session(client)
+                    video_url = client.get_video_url(course_id, sub_id)
+                    vpn_url, http_headers = client.get_stream_params(video_url)
+                    print(f"    Retrying with fresh connection...")
+                else:
+                    print(f"    [FAIL] All {max_attempts} attempts got incomplete audio, using best result.")
+                    # Use the partial transcript rather than failing entirely
+                    transcript = transcriber._last_transcript
+                    db.update_transcript(sub_id, transcript)
+            except Exception as e:
+                print(f"    [FAIL] Transcription error: {type(e).__name__}: {e}")
+                db.update_error(sub_id, "transcribe", str(e))
+                raise
 
     # 2) Summarize
     if not transcript.strip():
@@ -165,6 +193,18 @@ def run():
                 if lec.get("has_playback")
                 and str(lec["sub_id"]) not in known_processed
             ]
+            # Deduplicate by sub_title (school system sometimes lists duplicates)
+            seen_titles = set()
+            deduped = []
+            for lec in new_lectures:
+                title = lec.get("sub_title", "")
+                if title in seen_titles:
+                    print(f"  [Dedup] Skipping duplicate: {title}"
+                          f" (sub_id={lec['sub_id']})")
+                    continue
+                seen_titles.add(title)
+                deduped.append(lec)
+            new_lectures = deduped
             # Also retry any previously inserted but unprocessed
             unprocessed = db.get_unprocessed_lectures(course_id)
             new_ids = {str(lec["sub_id"]) for lec in new_lectures}
